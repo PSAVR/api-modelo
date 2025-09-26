@@ -1,0 +1,8 @@
+{
+  "LANG_KEYS": ["es", "qu"],
+  "CORP_KEYS": ["globalv1", "quechua"],
+  "LANG_ALIAS": {"es-ES": "es", "ES": "es", "qu-PE": "qu"},
+  "CORP_ALIAS": {"global": "globalv1"},
+  "mu": 0.11410142481327057,
+  "sd": 0.10235130786895752
+}

@@ -1,0 +1,16 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+gunicorn==22.0.0
+transformers==4.44.2
+torch==2.3.1
+torchaudio==2.3.1
+torchcrepe==0.0.23
+soundfile==0.12.1
+joblib==1.4.2
+librosa==0.10.2.post1
+numpy==1.26.4
+scikit-learn==1.6.1
+xgboost==2.0.3
+python-multipart==0.0.9
+celery==5.3.6
+redis==5.0.4

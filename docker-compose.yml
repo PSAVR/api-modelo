@@ -1,0 +1,31 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    container_name: vad-api
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+
+  worker:
+    build: .
+    container_name: vad-worker
+
+    command: celery -A app.celery_app.celery worker --pool=solo --loglevel=INFO
+    depends_on:
+      - redis
+    environment:
+      - ROLE=worker
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - C_FORCE_ROOT=1
