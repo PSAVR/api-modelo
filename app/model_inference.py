@@ -4,7 +4,7 @@ import numpy as np
 import torch, torchaudio, torchcrepe, librosa, soundfile as sf, joblib
 from transformers import AutoFeatureExtractor, AutoModel
 
-# ---------------- Config ----------------
+# configuración
 MODEL_NAME = "facebook/wav2vec2-large-xlsr-53"
 TARGET_SR  = 16000
 WIN_SEC    = float(os.getenv("WIN_SEC", 1.0))
@@ -12,14 +12,14 @@ HOP_SEC    = float(os.getenv("HOP_SEC", 0.5))
 TRIM_P     = float(os.getenv("VAL_TRIM_P", 0.10))
 CAL_LEVEL  = os.getenv("CAL_LEVEL", "clip").lower()
 
-# ---------------- Logging ----------------
+# debug logger
 log = logging.getLogger("vad-api")
 DEBUG = bool(int(os.getenv("DEBUG", "1")))
 def dbg(msg, **kw):
     if DEBUG:
         log.debug(msg + ((" | " + json.dumps(kw)) if kw else ""))
 
-# ---------------- Lazy-load wav2vec2 ----------------
+# carga modelo Wav2Vec2
 feature_extractor = None
 encoder = None
 def get_models():
@@ -31,7 +31,7 @@ def get_models():
         logging.info("Modelo cargado correctamente.")
     return feature_extractor, encoder
 
-# ---------------- Load regressors & calibrators ----------------
+# carga modelos de regresión
 def _load_reg(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"No se encuentra: {path}")
@@ -50,7 +50,7 @@ iso_v = joblib.load("models/valence/iso_per_lang.joblib") if os.path.exists("mod
 iso_a = joblib.load("models/arousal/iso_global.joblib") if os.path.exists("models/arousal/iso_global.joblib") else None
 iso_d = joblib.load("models/dominance/iso_global.joblib") if os.path.exists("models/dominance/iso_global.joblib") else None
 
-# ---------------- Load META & acoustic scaler ----------------
+# carga META y normalización acústica
 META = {}
 try:
     with open("models/meta.json", "r") as f:
@@ -69,14 +69,15 @@ except FileNotFoundError:
     MU_AC = SD_AC = None
     log.warning("No se encontró acoustic_norm.json, se omite normalización acústica.")
 
-# === Precarga de modelo al iniciar Celery ===
-try:
-    _ = get_models()
-    print("✅ Modelo Wav2Vec2 precargado correctamente en el worker.")
-except Exception as e:
-    print(f"No se pudo precargar el modelo Wav2Vec2: {e}")
+# Precarga de modelo al iniciar Celery ===
+if os.getenv("ROLE", "").lower() == "worker":
+    try:
+        _ = get_models()
+        print("Modelo Wav2Vec2 precargado correctamente en el worker.")
+    except Exception as e:
+        print(f"No se pudo precargar el modelo Wav2Vec2: {e}")
 
-# ---------------- Feature extraction helpers ----------------
+# funciones de procesamiento de audio
 def to_mono(w): return w if w.ndim == 1 else w.mean(axis=1)
 
 def resample_16k(w, sr):
@@ -93,13 +94,17 @@ def rms(x): return float(np.sqrt(np.mean(x*x) + 1e-12))
 
 @torch.inference_mode()
 def embed_batch(wavs_16k):
-    log.info(f"[embed] start batch={len(wavs_16k)}")
     global feature_extractor, encoder
-    fe, enc = feature_extractor, encoder
+    if feature_extractor is None or encoder is None:
+        logging.warning("[embed] Modelo no estaba cargado, inicializando...")
+        feature_extractor, encoder = get_models()
+        logging.info("[embed] Modelo cargado dinámicamente dentro del worker.")
+
+    log.info(f"[embed] start batch={len(wavs_16k)}")
     log.info("[embed] got models")
-    inputs = fe(wavs_16k, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
+    inputs = feature_extractor(wavs_16k, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
     log.info("[embed] feature extractor done")
-    hs = enc(**inputs).last_hidden_state
+    hs = encoder(**inputs).last_hidden_state
     log.info("[embed] forward done")
     mean, std = hs.mean(dim=1), hs.std(dim=1)
     emb = torch.cat([mean, std], dim=1).cpu().numpy().astype(np.float32)
@@ -168,16 +173,25 @@ def apply_iso(model_or_dict, value, lang="es"):
         return iso.predict([value])[0]
     return model_or_dict.predict([value])[0]
 
+def chunk_audio(w, sr, chunk_sec=15):
+    hop = int(chunk_sec * sr)
+    return [w[i:i+hop] for i in range(0, len(w), hop)]
+
 # ---------------- Prediction pipeline ----------------
 def predict_from_wave(wave, sr):
     try:
         w = resample_16k(to_mono(wave), sr)
-        rms_list = np.array([rms(w)], np.float32)
-        emb = embed_batch([w])
-        acoustic_feats = extract_acoustic_features([w])
+        chunks = chunk_audio(w, TARGET_SR)
+        rms_list = np.array([rms(c) for c in chunks], np.float32)
+        emb_parts, BATCH_SIZE = [], 2
+        for i in range(0, len(chunks), BATCH_SIZE):
+            emb_chunk = embed_batch(chunks[i:i+BATCH_SIZE])
+            emb_parts.append(emb_chunk)
+        emb = np.concatenate(emb_parts, axis=0)
+        acoustic_feats = extract_acoustic_features(chunks)
         X = build_features_v3(emb, rms_list, acoustic_feats, lang="es")
 
-        # Predict
+        # Predice
         v_w_raw = np.asarray(reg_v.predict(X), np.float32)
         log.info(f"Ventanas predichas: valence min={v_w_raw.min():.4f}, max={v_w_raw.max():.4f}, mean={v_w_raw.mean():.4f}")
         a_w_raw = np.asarray(reg_a.predict(X), np.float32)
@@ -209,17 +223,187 @@ def predict_from_wave(wave, sr):
         log.exception("Fallo en predict_from_wave")
         raise
 
-# ---------------- Anxiety score ----------------
+# cálculo de ansiedad
+import numpy as np
+
 def anxiety_percent_from_vad(v, a, d, decimals=2):
-    ANX, SAFE = np.array([1,5,1]), np.array([5,1,5])
-    dist_max = np.linalg.norm(ANX - SAFE)
-    sim = 1.0 - np.linalg.norm(np.array([v,a,d]) - ANX) / (dist_max + 1e-12)
-    return round(sim*100, decimals)
+    """
+    % anxiety (v,a,d) 1–5
+    """
+    # polos emocionales    
+    ANX  = np.array([1.5, 4.3, 1.5])   # ansiedad
+    SAFE = np.array([4.5, 1.5, 4.5])   # relajado / seguro
+    CONF = np.array([3.8, 2.8, 4.2])   # confiado / equilibrado
+    vec  = np.array([v, a, d])
+
+    # distancias euclidianas
+    dist_anx  = np.linalg.norm(vec - ANX)
+    dist_safe = np.linalg.norm(vec - SAFE)
+
+    # Polaridad de ansiedad relativa  (-1 … +1)
+    raw = (dist_safe - dist_anx) / (dist_safe + dist_anx + 1e-12)
+
+    # Ajustes basados en VAD
+    # Low valence + high arousal = tension
+    valence_stress   = np.clip((3 - v) / 2, 0, 1)
+    arousal_tension  = np.clip((a - 3) / 2, 0, 1)
+    dominance_relief = np.clip((d - 3) / 2, 0, 1)  # más control ↓ ansiedad
+
+    # ajuste lineal
+    adj = (
+        raw
+        + 0.25 * arousal_tension * valence_stress   # más tensión → mayor ansiedad
+        - 0.40 * dominance_relief                   # control/agency reduce ansiedad
+        - 0.10 * (v - 3)                            # penaliza ligeramente la valencia positiva
+    )
+
+    # normaliza a 0–100%
+    score = np.clip((adj + 1) / 2, 0, 1) * 100
+    return round(score, decimals)
+
+def count_meaningful_pauses(
+    wave, sr,
+    frame_len=0.025,    # 25 ms frames
+    hop_len=0.010,
+    min_pause_dur=0.08, # ≥80 ms micro-pause
+    min_speech_gap=0.08,
+    rms_med_win=3,      # - smoothing
+    std_factor=1.2 
+    ):
+    """Detect meaningful pauses (silences) and return metrics."""
+    # Normaliza (- high-noise bias)
+    wave = wave / (np.max(np.abs(wave)) + 1e-6)
+
+    # Validación: audio vacío o sin señal
+    if np.allclose(wave, 0, atol=1e-4) or np.std(wave) < 1e-4:
+        print("[DEBUG] Audio sin señal detectable (silencio total o ruido mínimo)")
+        audio_dur = len(wave) / sr
+        return 0, 0.0, 0.0, audio_dur, audio_dur
+
+    FL = int(frame_len * sr)
+    HL = int(hop_len * sr)
+    rms = librosa.feature.rms(y=wave, frame_length=FL, hop_length=HL)[0]
+
+    # Validación: energía demasiado baja
+    if np.mean(rms) < 1e-4:
+        print("[DEBUG] RMS promedio muy bajo — audio casi silencioso")
+        audio_dur = len(wave) / sr
+        return 0, 0.0, 0.0, audio_dur, audio_dur
+
+    rms = librosa.feature.rms(y=wave, frame_length=FL, hop_length=HL)[0]
+    if rms_med_win > 1:
+        pad = rms_med_win // 2
+        rms_sm = np.pad(rms, (pad, pad), mode="edge")
+        rms_sm = np.array([
+            np.median(rms_sm[i:i+rms_med_win])
+            for i in range(len(rms_sm) - rms_med_win + 1)
+        ])
+    else:
+        rms_sm = rms
+
+    # threshold basado en estadísticas
+    thr = np.mean(rms_sm) - std_factor * np.std(rms_sm)
+    thr = max(thr, np.percentile(rms_sm, 10))  # cap low bound
+    sil = rms_sm < thr
+
+    pauses, in_sil, start = [], False, 0
+    for i, s in enumerate(sil):
+        if s and not in_sil:
+            in_sil, start = True, i
+        elif not s and in_sil:
+            in_sil = False
+            dur = (i - start) * hop_len
+            if dur >= min_pause_dur:
+                pauses.append((start, i, dur))
+    if in_sil:
+        dur = (len(sil) - start) * hop_len
+        if dur >= min_pause_dur:
+            pauses.append((start, len(sil), dur))
+
+    # combina pausas cercanas
+    merged = []
+    for p in pauses:
+        if not merged:
+            merged.append(p)
+            continue
+        s0, e0, _ = merged[-1]
+        s1, e1, _ = p
+        gap = (s1 - e0) * hop_len
+        if gap < min_speech_gap:
+            merged[-1] = (s0, e1, (e1 - s0) * hop_len)
+        else:
+            merged.append(p)
+
+    pause_count = len(merged)
+    total_sil_dur = sum(d for _, _, d in merged)
+    audio_dur = len(wave) / sr
+    pause_ratio = total_sil_dur / max(audio_dur, 1e-6)
+    pauses_per_min = pause_count / max(audio_dur / 60.0, 1e-6)
+
+    # Debug 
+    print(f"[DEBUG] thr={thr:.5f}, silent_frames={sil.sum()}, pauses={pause_count}")
+
+    return pause_count, pause_ratio, pauses_per_min, total_sil_dur, audio_dur
 
 def run_anxiety_analysis(audio_bytes, decimals=2):
+    """Analiza ansiedad de voz (VAD + pausas)."""
     wave, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
-    if wave.ndim > 1: wave = wave.mean(axis=1)
-    log.info(f"Audio cargado: {len(wave)/sr:.2f}s a {sr}Hz")
+    if wave.ndim > 1:
+        wave = wave.mean(axis=1)
+    audio_dur = len(wave) / sr
+    log.info(f"Audio cargado: {audio_dur:.2f}s a {sr}Hz")
+
+    # --- pausas ---
+    pc, pr, ppm, sil_sec, dur_sec = count_meaningful_pauses(wave, sr)
+
+    if sil_sec == dur_sec:
+        log.warning("Audio sin señal detectable (silencio total o ruido mínimo)")
+        return {
+            "valence": None,
+            "arousal": None,
+            "dominance": None,
+            "pause_count": int(pc),
+            "pauses_per_min": 0.0,
+            "pause_ratio": 1.0,
+            "silence_seconds": round(sil_sec, 2),
+            "audio_seconds": round(dur_sec, 2),
+            "anxiety_base_vad": None,
+            "anxiety_pct": None,
+        }
+
+    # predicción VAD
     out = predict_from_wave(wave, sr)
-    v, a, d = [out["clip"][k] for k in ("valence","arousal","dominance")]
-    return {"anxiety_pct": anxiety_percent_from_vad(v,a,d,decimals)}
+    v, a, d = [out["clip"][k] for k in ("valence", "arousal", "dominance")]
+
+    base = anxiety_percent_from_vad(v, a, d, decimals)
+
+    # corregir escalado poco realista para clips más cortos de 60 s
+    if audio_dur < 60:
+        ppm = pc / max(audio_dur, 1e-6)  # pausas por segundo
+        log.info(f"[Short clip] {pc} pausas en {audio_dur:.2f}s → {ppm:.2f} pausas/s")
+        pauses_per_min = ppm * 60 * (audio_dur / 60)  # neutralizar extrapolación
+    else:
+        pauses_per_min = pc / max(audio_dur/60.0, 1e-6)
+
+    # reducir peso de pausa para clips cortos (< 60 s)
+    dur_factor = np.clip(audio_dur / 60.0, 0, 1)
+
+    pause_rate_factor  = np.clip((pauses_per_min - 4) / 8, 0, 1)
+    pause_ratio_factor = np.clip((pr - 0.08) / 0.15, 0, 1)
+    pause_factor = (0.6 * pause_rate_factor + 0.4 * pause_ratio_factor) * dur_factor
+
+    adjusted = base * (1 + 0.35 * pause_factor)
+    adjusted = float(np.clip(adjusted, 0, 100))
+
+    return {
+        "valence": round(v, 3),
+        "arousal": round(a, 3),
+        "dominance": round(d, 3),
+        "pause_count": int(pc),
+        "pauses_per_min": round(pauses_per_min, 2),
+        "pause_ratio": round(pr, 3),
+        "silence_seconds": round(sil_sec, 2),
+        "audio_seconds": round(dur_sec, 2),
+        "anxiety_base_vad": round(base, decimals),
+        "anxiety_pct": round(adjusted, decimals),
+    }
