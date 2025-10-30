@@ -27,7 +27,8 @@ def root():
 
 @app.post("/anxiety_async")
 async def anxiety_async(file: UploadFile = File(...), user_id: str = Form(...) ):
-    audio_bytes = await file.read()
+    audio_bytes = bytes(file.file.read()) 
+    log.info(f"✅ Recibido archivo {file.filename} ({len(audio_bytes)} bytes) user_id={user_id}")
     task = anxiety_task.delay(audio_bytes, user_id)
     log.info(f"Tarea encolada: {task.id} para user_id={user_id}")
     return {"task_id": task.id, "user_id": user_id}

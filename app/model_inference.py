@@ -263,108 +263,135 @@ def anxiety_percent_from_vad(v, a, d, decimals=2):
 
 def count_meaningful_pauses(
     wave, sr,
-    frame_len=0.025,    # 25 ms frames
-    hop_len=0.010,
-    min_pause_dur=0.08, # ≥80 ms micro-pause
-    min_speech_gap=0.08,
-    rms_med_win=3,      # - smoothing
-    std_factor=1.2 
-    ):
-    """Detect meaningful pauses (silences) and return metrics."""
-    # Normaliza (- high-noise bias)
-    wave = wave / (np.max(np.abs(wave)) + 1e-6)
-
-    # Validación: audio vacío o sin señal
-    if np.allclose(wave, 0, atol=1e-4) or np.std(wave) < 1e-4:
-        print("[DEBUG] Audio sin señal detectable (silencio total o ruido mínimo)")
-        audio_dur = len(wave) / sr
-        return 0, 0.0, 0.0, audio_dur, audio_dur
+    frame_len=0.032,          # 32 ms por frame
+    hop_len=0.010,            # salto de 10 ms
+    min_pause_dur=0.15,       # pausa mínima 150 ms
+    min_speech_gap=0.15,      # une pausas separadas por <150 ms
+    rms_med_win=5,            # mediana 5 frames (~70 ms)
+    thr_percentile=25,        # umbral adaptativo bajo
+    std_factor=1.0            # sensibilidad al ruido
+):
+    """
+    Detecta pausas significativas en una señal de voz.
+    Devuelve: (pause_count, pause_ratio, pauses_per_min, silence_seconds, audio_seconds)
+    """
 
     FL = int(frame_len * sr)
     HL = int(hop_len * sr)
+    audio_dur = len(wave) / sr
+
+    if np.abs(wave).max() < 1e-3: # energía para analizar?
+        # ruido muy bajo, mantener igual
+        padded_wave = wave
+    else:
+        pad_dur = 1.0  # segundos
+        pad_len = int(sr * pad_dur)
+        padded_wave = np.concatenate([wave, np.zeros(pad_len, dtype=wave.dtype)])
+    wave = padded_wave
+
+    # --- RMS por frame ---
     rms = librosa.feature.rms(y=wave, frame_length=FL, hop_length=HL)[0]
 
-    # Validación: energía demasiado baja
-    if np.mean(rms) < 1e-4:
-        print("[DEBUG] RMS promedio muy bajo — audio casi silencioso")
-        audio_dur = len(wave) / sr
-        return 0, 0.0, 0.0, audio_dur, audio_dur
-
-    rms = librosa.feature.rms(y=wave, frame_length=FL, hop_length=HL)[0]
+    # Suavizado mediano para evitar respiraciones y clics
     if rms_med_win > 1:
         pad = rms_med_win // 2
         rms_sm = np.pad(rms, (pad, pad), mode="edge")
-        rms_sm = np.array([
-            np.median(rms_sm[i:i+rms_med_win])
-            for i in range(len(rms_sm) - rms_med_win + 1)
-        ])
+        rms_sm = np.array([np.median(rms_sm[i:i+rms_med_win])
+                           for i in range(len(rms_sm)-rms_med_win+1)])
     else:
         rms_sm = rms
 
-    # threshold basado en estadísticas
-    thr = np.mean(rms_sm) - std_factor * np.std(rms_sm)
-    thr = max(thr, np.percentile(rms_sm, 10))  # cap low bound
-    sil = rms_sm < thr
+    # --- Umbral adaptativo ---
+    thr_base = np.percentile(rms_sm, thr_percentile)
+    std_rms  = np.std(rms_sm) if len(rms_sm) > 1 else 0
+    thr = max(thr_base, std_factor * std_rms * 0.2)
+    silent = rms_sm < thr
 
-    pauses, in_sil, start = [], False, 0
-    for i, s in enumerate(sil):
-        if s and not in_sil:
-            in_sil, start = True, i
-        elif not s and in_sil:
-            in_sil = False
-            dur = (i - start) * hop_len
-            if dur >= min_pause_dur:
-                pauses.append((start, i, dur))
-    if in_sil:
-        dur = (len(sil) - start) * hop_len
-        if dur >= min_pause_dur:
-            pauses.append((start, len(sil), dur))
+    # --- Agrupar regiones de silencio ---
+    pauses = []
+    min_frames = int(min_pause_dur / hop_len)
+    cur_len = 0
 
-    # combina pausas cercanas
-    merged = []
-    for p in pauses:
-        if not merged:
-            merged.append(p)
-            continue
-        s0, e0, _ = merged[-1]
-        s1, e1, _ = p
-        gap = (s1 - e0) * hop_len
-        if gap < min_speech_gap:
-            merged[-1] = (s0, e1, (e1 - s0) * hop_len)
+    for s in silent:
+        if s:
+            cur_len += 1
         else:
-            merged.append(p)
+            if cur_len >= min_frames:
+                pauses.append(cur_len)
+            cur_len = 0
+    if cur_len >= min_frames:
+        pauses.append(cur_len)
 
-    pause_count = len(merged)
-    total_sil_dur = sum(d for _, _, d in merged)
-    audio_dur = len(wave) / sr
-    pause_ratio = total_sil_dur / max(audio_dur, 1e-6)
+    pause_durs = np.array(pauses) * hop_len
+    pause_count = len(pause_durs)
+    silence_seconds = pause_durs.sum() if pause_count > 0 else 0.0
+
+    pause_ratio = silence_seconds / max(audio_dur, 1e-6)
     pauses_per_min = pause_count / max(audio_dur / 60.0, 1e-6)
 
-    # Debug 
-    print(f"[DEBUG] thr={thr:.5f}, silent_frames={sil.sum()}, pauses={pause_count}")
-
-    return pause_count, pause_ratio, pauses_per_min, total_sil_dur, audio_dur
+    return pause_count, pause_ratio, pauses_per_min, silence_seconds, audio_dur
 
 def run_anxiety_analysis(audio_bytes, decimals=2):
     """Analiza ansiedad de voz (VAD + pausas)."""
-    wave, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+    try:
+        wave, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+    except Exception as e:
+        log.warning(f"sf.read falló ({type(e).__name__}): intentando con librosa...")
+        try:
+            wave, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+        except Exception as e2:
+            log.error(f"No se pudo decodificar el audio: {e2}")
+            return {
+                "status": "invalid_audio",
+                "valence": None, "arousal": None, "dominance": None,
+                "pause_count": 0, "pauses_per_min": 0.0, "pause_ratio": 1.0,
+                "silence_seconds": 0.0, "audio_seconds": 0.0,
+                "anxiety_base_vad": None, "anxiety_pct": None,
+            }
+
+    # Si llega aquí, el audio es válido:
     if wave.ndim > 1:
         wave = wave.mean(axis=1)
     audio_dur = len(wave) / sr
-    log.info(f"Audio cargado: {audio_dur:.2f}s a {sr}Hz")
+    rms_global = float(np.sqrt(np.mean(wave ** 2) + 1e-12))
+    log.info(f"Audio cargado correctamente: {audio_dur:.2f}s a {sr}Hz (RMS={rms_global:.6f})")
+
+    if rms_global < 5e-3:  # silencio?
+        log.warning("Audio RMS muy bajo — sin voz detectable.")
+        return {
+            "valence": None, "arousal": None, "dominance": None,
+            "pause_count": None, "pauses_per_min": None, "pause_ratio": None,
+            "silence_seconds": audio_dur, "audio_seconds": audio_dur,
+            "anxiety_base_vad": None, "anxiety_pct": None,
+    }
 
     # --- pausas ---
     pc, pr, ppm, sil_sec, dur_sec = count_meaningful_pauses(wave, sr)
 
-    if sil_sec == dur_sec:
+    if dur_sec <= 31:
+        if sil_sec > 16:
+            log.warning("Audio sin señal detectable (silencio total o ruido mínimo)")
+            return {
+                "valence": None,
+                "arousal": None,
+                "dominance": None,
+                "pause_count": int(pc),
+                "pauses_per_min": 0.0,
+                "pause_ratio": 1.0,
+                "silence_seconds": round(sil_sec, 2),
+                "audio_seconds": round(dur_sec, 2),
+                "anxiety_base_vad": None,
+                "anxiety_pct": None,
+            }
+    elif dur_sec - sil_sec < 30:
         log.warning("Audio sin señal detectable (silencio total o ruido mínimo)")
         return {
             "valence": None,
             "arousal": None,
             "dominance": None,
-            "pause_count": int(pc),
-            "pauses_per_min": 0.0,
-            "pause_ratio": 1.0,
+            "pause_count": None,
+            "pauses_per_min": None,
+            "pause_ratio": None,
             "silence_seconds": round(sil_sec, 2),
             "audio_seconds": round(dur_sec, 2),
             "anxiety_base_vad": None,
