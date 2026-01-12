@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7
@@ -10,7 +8,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: api
     ports:
       - "8080:8080"
     environment:
@@ -22,10 +19,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: api
+    command: celery -A app.celery_app.celery worker --pool=solo --loglevel=INFO
     environment:
       - REDIS_URL=redis://redis:6379/0
       - ROLE=worker
     depends_on:
       - redis
-    command: celery -A app.celery_app.celery worker --pool=solo --loglevel=INFO
