@@ -26,3 +26,8 @@ services:
       - ROLE=worker
     depends_on:
       - redis
+    deploy:
+    resources:
+      reservations:
+        devices:
+          - capabilities: [gpu]
