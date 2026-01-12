@@ -1,0 +1,14 @@
+# Dockerfile.worker
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/root/.cache/huggingface \
+    ROLE=worker
+
+WORKDIR /app
+
+COPY --from=vad-base /app /app
+
+CMD ["celery", "-A", "app.celery_app.celery", "worker", "--pool=solo", "--loglevel=INFO"]

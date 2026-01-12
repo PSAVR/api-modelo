@@ -12,24 +12,42 @@ HOP_SEC    = float(os.getenv("HOP_SEC", 0.5))
 TRIM_P     = float(os.getenv("VAL_TRIM_P", 0.10))
 CAL_LEVEL  = os.getenv("CAL_LEVEL", "clip").lower()
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 # debug logger
 log = logging.getLogger("vad-api")
 DEBUG = bool(int(os.getenv("DEBUG", "1")))
+
 def dbg(msg, **kw):
     if DEBUG:
         log.debug(msg + ((" | " + json.dumps(kw)) if kw else ""))
 
-# carga modelo Wav2Vec2
-feature_extractor = None
-encoder = None
-def get_models():
-    global feature_extractor, encoder
-    if feature_extractor is None or encoder is None:
-        logging.info(f"Cargando modelo {MODEL_NAME} desde HuggingFace...")
-        feature_extractor = AutoFeatureExtractor.from_pretrained(MODEL_NAME)
-        encoder = AutoModel.from_pretrained(MODEL_NAME).eval()
-        logging.info("Modelo cargado correctamente.")
-    return feature_extractor, encoder
+# ---------------- Lazy globals (no importe pesado) ----------------
+_feature_extractor = None
+_encoder = None
+
+_reg_v = None
+_reg_a = None
+_reg_d = None
+
+_iso_v = None
+_iso_a = None
+_iso_d = None
+
+_META = None
+_MU_AC = None
+_SD_AC = None
+
+_mfcc_tfm = None  # cache MFCC transform
+
+# ---------------- Loaders ----------------
+def _load_json(path: str, default=None):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
 
 # carga modelos de regresión
 def _load_reg(path):
@@ -42,114 +60,142 @@ def _load_reg(path):
         if len(obj) == 1: return next(iter(obj.values()))
     return obj
 
-reg_v = _load_reg("models/valence/xgb_model.joblib")
-reg_a = _load_reg("models/arousal/xgb_model.joblib")
-reg_d = _load_reg("models/dominance/xgb_model.joblib")
+def init_regressors_and_norm():
+    """Carga joblibs/meta SOLO una vez, cuando se necesita."""
+    global _reg_v, _reg_a, _reg_d, _iso_v, _iso_a, _iso_d, _META, _MU_AC, _SD_AC
 
-iso_v = joblib.load("models/valence/iso_per_lang.joblib") if os.path.exists("models/valence/iso_per_lang.joblib") else None
-iso_a = joblib.load("models/arousal/iso_global.joblib") if os.path.exists("models/arousal/iso_global.joblib") else None
-iso_d = joblib.load("models/dominance/iso_global.joblib") if os.path.exists("models/dominance/iso_global.joblib") else None
+    if _reg_v is not None:
+        return  # ya está
 
-# carga META y normalización acústica
-META = {}
-try:
-    with open("models/meta.json", "r") as f:
-        META = json.load(f)
-    log.info("Meta cargado correctamente.")
-except FileNotFoundError:
-    log.warning("Meta no encontrado. Usando defaults.")
+    log.info("Cargando regresores/calibradores/meta...")
+    _reg_v = _load_reg("models/valence/xgb_model.joblib")
+    _reg_a = _load_reg("models/arousal/xgb_model.joblib")
+    _reg_d = _load_reg("models/dominance/xgb_model.joblib")
 
-MU_AC, SD_AC = None, None
-try:
-    with open("models/valence/acoustic_val.json", "r") as f:
-        norm = json.load(f)
-        MU_AC = np.array(norm["mu_ac"], np.float32)
-        SD_AC = np.array(norm["sd_ac"], np.float32)
-except FileNotFoundError:
-    MU_AC = SD_AC = None
-    log.warning("No se encontró acoustic_norm.json, se omite normalización acústica.")
+    _iso_v = joblib.load("models/valence/iso_per_lang.joblib") if os.path.exists("models/valence/iso_per_lang.joblib") else None
+    _iso_a = joblib.load("models/arousal/iso_global.joblib") if os.path.exists("models/arousal/iso_global.joblib") else None
+    _iso_d = joblib.load("models/dominance/iso_global.joblib") if os.path.exists("models/dominance/iso_global.joblib") else None
 
-# Precarga de modelo al iniciar Celery ===
-if os.getenv("ROLE", "").lower() == "worker":
-    try:
-        _ = get_models()
-        print("Modelo Wav2Vec2 precargado correctamente en el worker.")
-    except Exception as e:
-        print(f"No se pudo precargar el modelo Wav2Vec2: {e}")
+    _META = _load_json("models/meta.json", default={}) or {}
 
+    norm = _load_json("models/valence/acoustic_val.json", default=None)
+    if norm and "mu_ac" in norm and "sd_ac" in norm:
+        _MU_AC = np.array(norm["mu_ac"], np.float32)
+        _SD_AC = np.array(norm["sd_ac"], np.float32)
+    else:
+        _MU_AC = _SD_AC = None
+        log.warning("No se encontró acoustic_val.json (o faltan campos), se omite normalización acústica.")
+
+    log.info("Regresores/calibradores/meta cargados OK.")
+
+def get_wav2vec():
+    """Carga wav2vec SOLO una vez y lo mueve a GPU si hay."""
+    global _feature_extractor, _encoder
+
+    if _feature_extractor is None or _encoder is None:
+        log.info(f"Cargando {MODEL_NAME} (device={DEVICE})...")
+        _feature_extractor = AutoFeatureExtractor.from_pretrained(MODEL_NAME)
+        _encoder = AutoModel.from_pretrained(MODEL_NAME).eval().to(DEVICE)
+        log.info("Wav2Vec2 cargado correctamente.")
+    return _feature_extractor, _encoder
+
+
+def maybe_preload_for_worker():
+    """Se llama al iniciar el worker para 'warm start'."""
+    role = os.getenv("ROLE", "").lower()
+    if role == "worker":
+        try:
+            init_regressors_and_norm()
+            get_wav2vec()
+            log.info("Precarga completa en worker (regresores + wav2vec).")
+        except Exception as e:
+            log.exception(f"No se pudo precargar en worker: {e}")
+
+
+# Ejecuta precarga solo en worker
+maybe_preload_for_worker()
+
+# ---------------- Audio helpers ----------------
 # funciones de procesamiento de audio
 def to_mono(w): return w if w.ndim == 1 else w.mean(axis=1)
 
 def resample_16k(w, sr):
     return w if sr == TARGET_SR else librosa.resample(y=w, orig_sr=sr, target_sr=TARGET_SR)
 
-def frame_windows(wave, sr):
-    win = int(WIN_SEC*sr); hop = int(HOP_SEC*sr)
-    out = []
-    for i in range(0, len(wave) - win + 1, hop):
-        out.append(wave[i:i+win])
-    return out or [wave]
-
 def rms(x): return float(np.sqrt(np.mean(x*x) + 1e-12))
 
+def chunk_audio(w, sr, chunk_sec=15):
+    hop = int(chunk_sec * sr)
+    return [w[i:i + hop] for i in range(0, len(w), hop)]
+
+# ---------------- Embedding ----------------
 @torch.inference_mode()
 def embed_batch(wavs_16k):
-    global feature_extractor, encoder
-    if feature_extractor is None or encoder is None:
-        logging.warning("[embed] Modelo no estaba cargado, inicializando...")
-        feature_extractor, encoder = get_models()
-        logging.info("[embed] Modelo cargado dinámicamente dentro del worker.")
+    init_regressors_and_norm()  # garantiza que todo esté listo
+    fe, enc = get_wav2vec()
 
     log.info(f"[embed] start batch={len(wavs_16k)}")
-    log.info("[embed] got models")
-    inputs = feature_extractor(wavs_16k, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
-    log.info("[embed] feature extractor done")
-    hs = encoder(**inputs).last_hidden_state
-    log.info("[embed] forward done")
+    inputs = fe(wavs_16k, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
+
+    # mover inputs a device
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+    hs = enc(**inputs).last_hidden_state
     mean, std = hs.mean(dim=1), hs.std(dim=1)
-    emb = torch.cat([mean, std], dim=1).cpu().numpy().astype(np.float32)
+    emb = torch.cat([mean, std], dim=1).detach().cpu().numpy().astype(np.float32)
     log.info("[embed] pooled ok")
     return emb
 
 
+def _get_mfcc_tfm():
+    global _mfcc_tfm
+    if _mfcc_tfm is None:
+        _mfcc_tfm = torchaudio.transforms.MFCC(
+            sample_rate=TARGET_SR,
+            n_mfcc=13,
+            melkwargs={"n_fft": 400, "hop_length": 160, "n_mels": 80},
+        ).to(DEVICE)
+    return _mfcc_tfm
+
 def extract_acoustic_features(wavs_16k):
+    init_regressors_and_norm()
     feats = []
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    mfcc_tfm = torchaudio.transforms.MFCC(
-        sample_rate=TARGET_SR, n_mfcc=13,
-        melkwargs={"n_fft": 400, "hop_length": 160, "n_mels": 80},
-    ).to(device)
+    mfcc_tfm = _get_mfcc_tfm()
+
     for w in wavs_16k:
-        y = torch.from_numpy(w).to(device)
+        y = torch.from_numpy(w).to(DEVICE)
+
         with torch.no_grad():
             mfcc = mfcc_tfm(y)
             mfcc_mean, mfcc_std = mfcc.mean(dim=1), mfcc.std(dim=1)
-            f0 = librosa.yin(w, fmin=60, fmax=500, sr=TARGET_SR)
-            p_feats = np.array([np.nanmean(f0), np.nanstd(f0), np.nanmin(f0), np.nanmax(f0)], np.float32)
-            p_feats = torch.tensor(p_feats, device=device)
-            f = torch.cat([mfcc_mean, mfcc_std, p_feats]).cpu().numpy()
+
+        # librosa.yin usa numpy/CPU
+        f0 = librosa.yin(w, fmin=60, fmax=500, sr=TARGET_SR)
+        p_feats = np.array([np.nanmean(f0), np.nanstd(f0), np.nanmin(f0), np.nanmax(f0)], np.float32)
+        p_feats = torch.tensor(p_feats, device=DEVICE)
+
+        f = torch.cat([mfcc_mean, mfcc_std, p_feats]).detach().cpu().numpy()
         feats.append(f)
+
     return np.stack(feats, axis=0).astype(np.float32)
 
 def build_features_v3(emb, rms_list, acoustic_feats, lang="es"):
-    # RMS z-score
-    mu_rms = float(META.get("mu", 0.0))
-    sd_rms = float(META.get("sd", 1.0))
-    zrms = ((rms_list - mu_rms) / sd_rms)[:, None].astype(np.float32)
+    init_regressors_and_norm()
+    mu_rms = float((_META or {}).get("mu", 0.0))
+    sd_rms = float((_META or {}).get("sd", 1.0))
 
-    # log-RMS z-score
+    zrms = ((rms_list - mu_rms) / (sd_rms + 1e-9))[:, None].astype(np.float32)
+
     log_rms = np.log1p(np.clip(rms_list, 1e-9, None))
     mu_log, sd_log = log_rms.mean(), log_rms.std(ddof=1) + 1e-9
     zrms_log = ((log_rms - mu_log) / sd_log)[:, None].astype(np.float32)
 
-    # normalize acoustic feats
-    if MU_AC is not None and SD_AC is not None:
-        acoustic_feats = (acoustic_feats - MU_AC) / (SD_AC + 1e-8)
+    if _MU_AC is not None and _SD_AC is not None:
+        acoustic_feats = (acoustic_feats - _MU_AC) / (_SD_AC + 1e-8)
 
-    # language flag
     is_es = np.ones((len(emb), 1), np.float32) if lang == "es" else np.zeros((len(emb), 1), np.float32)
-
     return np.concatenate([emb, is_es, zrms, zrms_log, acoustic_feats], axis=1).astype(np.float32)
+
 
 def aggregate_vector(x, mode="mean", rms_weights=None, trim_p=0.10):
     if mode == "median": return float(np.median(x))
@@ -170,62 +216,64 @@ def apply_iso(model_or_dict, value, lang="es"):
         return value
     if isinstance(model_or_dict, dict):
         iso = model_or_dict.get(lang) or list(model_or_dict.values())[0]
-        return iso.predict([value])[0]
-    return model_or_dict.predict([value])[0]
-
-def chunk_audio(w, sr, chunk_sec=15):
-    hop = int(chunk_sec * sr)
-    return [w[i:i+hop] for i in range(0, len(w), hop)]
+        return float(iso.predict([value])[0])
+    return float(model_or_dict.predict([value])[0])
 
 # ---------------- Prediction pipeline ----------------
 def predict_from_wave(wave, sr):
-    try:
-        w = resample_16k(to_mono(wave), sr)
-        chunks = chunk_audio(w, TARGET_SR)
-        rms_list = np.array([rms(c) for c in chunks], np.float32)
-        emb_parts, BATCH_SIZE = [], 2
-        for i in range(0, len(chunks), BATCH_SIZE):
-            emb_chunk = embed_batch(chunks[i:i+BATCH_SIZE])
-            emb_parts.append(emb_chunk)
-        emb = np.concatenate(emb_parts, axis=0)
-        acoustic_feats = extract_acoustic_features(chunks)
-        X = build_features_v3(emb, rms_list, acoustic_feats, lang="es")
+    init_regressors_and_norm()
 
-        # Predice
-        v_w_raw = np.asarray(reg_v.predict(X), np.float32)
-        log.info(f"Ventanas predichas: valence min={v_w_raw.min():.4f}, max={v_w_raw.max():.4f}, mean={v_w_raw.mean():.4f}")
-        a_w_raw = np.asarray(reg_a.predict(X), np.float32)
-        log.info(f"Ventanas predichas: arousal min={a_w_raw.min():.4f}, max={a_w_raw.max():.4f}, mean={a_w_raw.mean():.4f}")
-        d_w_raw = np.asarray(reg_d.predict(X), np.float32)
-        log.info(f"Ventanas predichas: dominance min={d_w_raw.min():.4f}, max={d_w_raw.max():.4f}, mean={d_w_raw.mean():.4f}")
+    w = resample_16k(to_mono(wave), sr)
+    chunks = chunk_audio(w, TARGET_SR)
 
-        if CAL_LEVEL == "window":
-            v_w, a_w, d_w = [np.clip(iso_v.predict(v_w_raw),0,1),
-                             np.clip(iso_a.predict(a_w_raw),0,1),
-                             np.clip(iso_d.predict(d_w_raw),0,1)]
+    rms_list = np.array([rms(c) for c in chunks], np.float32)
+
+    emb_parts, BATCH_SIZE = [], 2
+    for i in range(0, len(chunks), BATCH_SIZE):
+        emb_parts.append(embed_batch(chunks[i:i + BATCH_SIZE]))
+    emb = np.concatenate(emb_parts, axis=0)
+
+    acoustic_feats = extract_acoustic_features(chunks)
+    X = build_features_v3(emb, rms_list, acoustic_feats, lang="es")
+
+    v_w_raw = np.asarray(_reg_v.predict(X), np.float32)
+    a_w_raw = np.asarray(_reg_a.predict(X), np.float32)
+    d_w_raw = np.asarray(_reg_d.predict(X), np.float32)
+
+    log.info(f"Ventanas: V(min={v_w_raw.min():.4f}, max={v_w_raw.max():.4f}, mean={v_w_raw.mean():.4f})")
+    log.info(f"Ventanas: A(min={a_w_raw.min():.4f}, max={a_w_raw.max():.4f}, mean={a_w_raw.mean():.4f})")
+    log.info(f"Ventanas: D(min={d_w_raw.min():.4f}, max={d_w_raw.max():.4f}, mean={d_w_raw.mean():.4f})")
+
+    if CAL_LEVEL == "window":
+        # ojo: si iso_v es dict por idioma, esto debe adaptarse por ventana; mantengo tu lógica “simple”
+        if _iso_v is not None:
+            v_w = np.clip(_iso_v.predict(v_w_raw), 0, 1)
         else:
-            v_w, a_w, d_w = v_w_raw, a_w_raw, d_w_raw
+            v_w = v_w_raw
+        if _iso_a is not None:
+            a_w = np.clip(_iso_a.predict(a_w_raw), 0, 1)
+        else:
+            a_w = a_w_raw
+        if _iso_d is not None:
+            d_w = np.clip(_iso_d.predict(d_w_raw), 0, 1)
+        else:
+            d_w = d_w_raw
+    else:
+        v_w, a_w, d_w = v_w_raw, a_w_raw, d_w_raw
 
-        # Aggregate to clip
-        v_clip_raw = aggregate_vector(v_w, "trimmed", rms_list, TRIM_P)
-        a_clip_raw = aggregate_vector(a_w, "trimmed", rms_list, TRIM_P)
-        d_clip_raw = aggregate_vector(d_w, "trimmed", rms_list, TRIM_P)
+    v_clip_raw = aggregate_vector(v_w, "trimmed", rms_list, TRIM_P)
+    a_clip_raw = aggregate_vector(a_w, "trimmed", rms_list, TRIM_P)
+    d_clip_raw = aggregate_vector(d_w, "trimmed", rms_list, TRIM_P)
 
-        v_clip = apply_iso(iso_v, v_clip_raw)
-        a_clip = apply_iso(iso_a, a_clip_raw)
-        d_clip = apply_iso(iso_d, d_clip_raw)
-        
-        log.info(f"Clip predicho: valence={v_clip:.4f}, arousal={a_clip:.4f}, dominance={d_clip:.4f}")
+    v_clip = apply_iso(_iso_v, v_clip_raw, lang="es")
+    a_clip = apply_iso(_iso_a, a_clip_raw, lang="es")
+    d_clip = apply_iso(_iso_d, d_clip_raw, lang="es")
 
-        return {"clip": {"valence": float(v_clip), "arousal": float(a_clip), "dominance": float(d_clip)}}
+    log.info(f"Clip: V={v_clip:.4f}, A={a_clip:.4f}, D={d_clip:.4f}")
+    return {"clip": {"valence": float(v_clip), "arousal": float(a_clip), "dominance": float(d_clip)}}
 
-    except Exception as e:
-        log.exception("Fallo en predict_from_wave")
-        raise
 
 # cálculo de ansiedad
-import numpy as np
-
 def anxiety_percent_from_vad(v, a, d, decimals=2):
     """
     % anxiety (v,a,d) 1–5
