@@ -23,5 +23,6 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - ROLE=worker
+      - C_FORCE_ROOT=1
     depends_on:
       - redis
